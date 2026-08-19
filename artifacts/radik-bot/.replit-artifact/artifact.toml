@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "RADIK AI BOT"
+description = "Web dashboard for Pocket Option demo signal analysis, two-minute trade tracking, and up to two recovery signals using protected SSID access."
+version = "1.0.0"
+id = "artifacts/radik-bot"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 21748
+
+[services.development]
+run = "pnpm --filter @workspace/radik-bot run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/radik-bot", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/radik-bot/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "21748"
+BASE_PATH = "/"
