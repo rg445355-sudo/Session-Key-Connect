@@ -26,3 +26,11 @@ to = "/index.html"
 [services.env]
 PORT = "21748"
 BASE_PATH = "/"
+
+[[services]]
+name = "pocket-bot"
+paths = [ "/api/bot" ]
+localPort = 8765
+
+[services.development]
+run = "python3 python-bot/bot.py"

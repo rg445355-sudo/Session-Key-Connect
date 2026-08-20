@@ -1,17 +1,13 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 
-const API_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/radik-bot`;
-const API_HEADERS = {
-  Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
-  'Content-Type': 'application/json',
-};
+const API_HEADERS = { 'Content-Type': 'application/json' };
 
-const FLAG: Record<string, string> = {
-  EUR: '🇪🇺', USD: '🇺🇸', GBP: '🇬🇧', JPY: '🇯🇵',
-  AUD: '🇦🇺', CAD: '🇨🇦', CHF: '🇨🇭', NZD: '🇳🇿',
-};
+type ConnectionStatus = 'connecting' | 'online' | 'offline';
+type Phase = 'idle' | 'ready' | 'live' | 'result';
+type Outcome = 'win' | 'lose';
 
 type Signal = {
+  id?: string | number;
   pair: string;
   direction: string;
   confidence: number;
@@ -24,74 +20,165 @@ type Signal = {
   reason?: string;
 };
 
-function flagsForPair(pair: string): [string, string] {
-  const parts = pair.replace(/\s/g, '').split('/');
-  if (parts.length === 2) {
-    return [FLAG[parts[0]] || '🏳️', FLAG[parts[1]] || '🏳️'];
+type BackendResult = {
+  outcome: Outcome | null;
+  closePrice: number | null;
+  recoveryCount: number;
+  message: string;
+};
+
+type HistoryItem = {
+  pair: string;
+  direction: string;
+  result: Outcome;
+  time: string;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function unwrapPayload(value: unknown): Record<string, unknown> {
+  if (!isRecord(value)) return {};
+  if (isRecord(value.data)) return value.data;
+  if (isRecord(value.signal)) return value.signal;
+  if (isRecord(value.result)) return value.result;
+  return value;
+}
+
+function textValue(value: unknown, fallback = '') {
+  return typeof value === 'string' || typeof value === 'number' ? String(value) : fallback;
+}
+
+function numberValue(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim() !== '' && Number.isFinite(Number(value))) {
+    return Number(value);
   }
-  const raw = pair.replace('_otc', '').toUpperCase();
-  const a = raw.slice(0, 3);
-  const b = raw.slice(3, 6);
-  return [FLAG[a] || '🏳️', FLAG[b] || '🏳️'];
+  return null;
 }
 
-function dirUp(d: string) {
-  return d === 'ВВЕРХ' || d === 'up' || d === 'call';
+function isAiUnavailable(value: unknown) {
+  const payloads = [value, unwrapPayload(value)];
+  return payloads.some(candidate => {
+    const payload = isRecord(candidate) ? candidate : {};
+    const status = textValue(payload.status).toLowerCase();
+    const error = textValue(payload.error).toLowerCase();
+    const message = textValue(payload.message).toLowerCase();
+    return payload.ai_available === false
+      || payload.aiAvailable === false
+      || payload.available === false
+      || status.includes('unavailable')
+      || error.includes('ai unavailable')
+      || message.includes('ai unavailable')
+      || message.includes('ии недоступ');
+  });
 }
 
-function formatTime(d: Date) {
-  return d.toLocaleTimeString('ru-RU', {
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-    timeZone: 'Europe/Moscow',
-  }) + ' MSK';
-}
-
-function fmtCountdown(s: number) {
-  const m = Math.floor(s / 60);
-  const sec = s % 60;
-  return `${m}:${sec.toString().padStart(2, '0')}`;
+function errorText(value: unknown, fallback: string) {
+  const payload = unwrapPayload(value);
+  const detail = payload.detail || payload.error || payload.message;
+  return textValue(detail, fallback);
 }
 
 async function apiGet(path: string, params?: Record<string, string>) {
-  const url = new URL(API_URL + path);
-  if (params) Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
-  const res = await fetch(url.toString(), { headers: API_HEADERS });
-  if (!res.ok) throw new Error(`API ${path}: ${res.status}`);
-  return res.json();
+  const query = params ? `?${new URLSearchParams(params).toString()}` : '';
+  const response = await fetch(`${path}${query}`, { headers: API_HEADERS });
+  const payload: unknown = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(errorText(payload, `Ошибка сервера: ${response.status}`));
+    if (isAiUnavailable(payload)) error.name = 'AI_UNAVAILABLE';
+    throw error;
+  }
+  return payload;
 }
 
 async function apiPost(path: string, body: Record<string, unknown>) {
-  const res = await fetch(API_URL + path, {
+  const response = await fetch(path, {
     method: 'POST',
     headers: API_HEADERS,
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`API ${path}: ${res.status}`);
-  return res.json();
+  const payload: unknown = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(errorText(payload, `Ошибка сервера: ${response.status}`));
+    if (isAiUnavailable(payload)) error.name = 'AI_UNAVAILABLE';
+    throw error;
+  }
+  return payload;
 }
 
-/** AI-style explanation from signal fields */
-function buildReason(s: Signal): string {
-  if (s.reason) return s.reason;
-  if (s.message && s.message.length > 20 && !s.message.includes('Открой сделку вручную')) {
-    return s.message;
+function formatTime(date: Date) {
+  return `${date.toLocaleTimeString('ru-RU', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    timeZone: 'Europe/Moscow',
+  })} MSK`;
+}
+
+function formatCountdown(seconds: number) {
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return `${minutes}:${remainder.toString().padStart(2, '0')}`;
+}
+
+function directionIsUp(direction: string) {
+  const normalized = direction.toLowerCase();
+  return normalized === 'вверх' || normalized === 'up' || normalized === 'call' || normalized === 'buy';
+}
+
+function directionLabel(direction: string) {
+  return directionIsUp(direction) ? 'ВВЕРХ' : 'ВНИЗ';
+}
+
+function marketCodes(pair: string): [string, string] {
+  const parts = pair.replace(/\s/g, '').replace(/_otc$/i, '').split('/');
+  if (parts.length === 2) return [parts[0], parts[1]];
+  const raw = pair.replace(/_otc$/i, '').replace(/[^a-z]/gi, '').toUpperCase();
+  return [raw.slice(0, 3) || 'FX', raw.slice(3, 6) || 'OTC'];
+}
+
+function normalizeSignal(value: unknown): Signal {
+  const payload = unwrapPayload(value);
+  const pair = textValue(payload.pair || payload.symbol);
+  const direction = textValue(payload.direction || payload.signal);
+  if (!pair || !direction) {
+    throw new Error('Сервер не вернул полный сигнал');
   }
-  const up = dirUp(s.direction);
-  const reasons = up
-    ? [
-        'Краткосрочный импульс вверх по последним свечам.',
-        'Покупательское давление на OTC-сессии усиливается.',
-        'Моментум и микро-тренд тиков совпадают с ростом.',
-        'Цена удерживается выше локальной поддержки.',
-      ]
-    : [
-        'Медвежий импульс по последним свечам.',
-        'Продавцы доминируют на коротком таймфрейме.',
-        'Тиковый поток указывает на снижение.',
-        'Цена не удерживает локальные максимумы.',
-      ];
-  const i = Math.abs((s.confidence || 80) + s.pair.length) % reasons.length;
-  return reasons[i] + ` Точность модели ${s.confidence}%, выплата ${s.payout}.`;
+  return {
+    id: typeof payload.id === 'string' || typeof payload.id === 'number' ? payload.id : undefined,
+    pair,
+    direction,
+    confidence: numberValue(payload.confidence) ?? 0,
+    expiry: textValue(payload.expiry || payload.expiration, '2 мин'),
+    payout: textValue(payload.payout, '—'),
+    time: textValue(payload.time || payload.created_at, formatTime(new Date())),
+    status: textValue(payload.status, 'ready'),
+    entry_price: numberValue(payload.entry_price ?? payload.entryPrice),
+    message: textValue(payload.message),
+    reason: textValue(payload.reason || payload.explanation),
+  };
+}
+
+function normalizeOutcome(value: unknown): Outcome | null {
+  if (typeof value === 'boolean') return value ? 'win' : 'lose';
+  const normalized = textValue(value).toLowerCase();
+  if (['win', 'won', 'winner', 'profit', 'success', 'выигрыш', 'победа'].includes(normalized)) return 'win';
+  if (['lose', 'loss', 'lost', 'loser', 'fail', 'failed', 'убыток', 'поражение'].includes(normalized)) return 'lose';
+  return null;
+}
+
+function normalizeResult(value: unknown): BackendResult {
+  const payload = unwrapPayload(value);
+  const outcome = normalizeOutcome(payload.won ?? payload.outcome ?? payload.result ?? payload.win_loss ?? payload.status);
+  const recovery = numberValue(payload.recovery_count ?? payload.recoveryCount) ?? 0;
+  return {
+    outcome,
+    closePrice: numberValue(payload.close_price ?? payload.closePrice ?? payload.final_close_price ?? payload.final_price),
+    recoveryCount: Math.max(0, Math.min(2, Math.trunc(recovery))),
+    message: textValue(payload.message),
+  };
 }
 
 export default function App() {
@@ -102,46 +189,107 @@ export default function App() {
   const [participantId, setParticipantId] = useState('');
 
   const [clock, setClock] = useState(() => formatTime(new Date()));
-  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'online' | 'offline'>('connecting');
-
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('connecting');
+  const [aiAvailable, setAiAvailable] = useState<boolean | null>(null);
   const [loading, setLoading] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
   const [signal, setSignal] = useState<Signal | null>(null);
-  const [phase, setPhase] = useState<'idle' | 'ready' | 'live' | 'result'>('idle');
+  const [phase, setPhase] = useState<Phase>('idle');
   const [countdown, setCountdown] = useState<number | null>(null);
-  const [result, setResult] = useState<'win' | 'lose' | null>(null);
+  const [result, setResult] = useState<Outcome | null>(null);
+  const [resultPending, setResultPending] = useState(false);
+  const [closePrice, setClosePrice] = useState<number | null>(null);
+  const [recoveryCount, setRecoveryCount] = useState(0);
   const [copied, setCopied] = useState(false);
   const [apiError, setApiError] = useState('');
-  const [history, setHistory] = useState<{ pair: string; direction: string; result: 'win' | 'lose'; time: string }[]>([]);
+  const [resultError, setResultError] = useState('');
+  const [history, setHistory] = useState<HistoryItem[]>([]);
 
   const timerEndRef = useRef<number | null>(null);
   const entryRef = useRef<number | null>(null);
+  const resultRequestedRef = useRef(false);
 
   useEffect(() => {
-    const id = setInterval(() => setClock(formatTime(new Date())), 1000);
-    return () => clearInterval(id);
+    const interval = window.setInterval(() => setClock(formatTime(new Date())), 1000);
+    return () => window.clearInterval(interval);
+  }, []);
+
+  const checkHealth = useCallback(async () => {
+    setConnectionStatus('connecting');
+    try {
+      const payload = await apiGet('/api/bot/health');
+      setConnectionStatus('online');
+      const data = unwrapPayload(payload);
+      setAiAvailable(isAiUnavailable(payload) ? false : data.ai_available === false || data.aiAvailable === false ? false : true);
+    } catch {
+      setConnectionStatus('offline');
+      setAiAvailable(null);
+    }
   }, []);
 
   useEffect(() => {
-    apiGet('/health')
-      .then(() => setConnectionStatus('online'))
-      .catch(() => setConnectionStatus('offline'));
-  }, []);
+    void checkHealth();
+  }, [checkHealth]);
 
-  /* countdown */
+  const finishSignal = useCallback(async () => {
+    if (!signal || phase === 'result' || resultRequestedRef.current) return;
+    resultRequestedRef.current = true;
+    setPhase('result');
+    setCountdown(null);
+    setResult(null);
+    setClosePrice(null);
+    setResultError('');
+    setResultPending(true);
+
+    try {
+      const payload = await apiPost('/api/bot/signal/result', {
+        participant_id: participantId,
+        signal_id: signal.id ?? null,
+        pair: signal.pair,
+        direction: signal.direction,
+        entry_price: entryRef.current,
+        started_at: timerEndRef.current ? new Date(timerEndRef.current - 120000).toISOString() : null,
+      });
+      const resolved = normalizeResult(payload);
+      setClosePrice(resolved.closePrice);
+      setRecoveryCount(resolved.recoveryCount);
+      if (!resolved.outcome) {
+        setResultError(resolved.message || 'Сервер не вернул итог сделки. Результат не определён.');
+        return;
+      }
+      setResult(resolved.outcome);
+      setHistory(items => [
+        {
+          pair: signal.pair,
+          direction: signal.direction,
+          result: resolved.outcome as Outcome,
+          time: formatTime(new Date()).replace(' MSK', ''),
+        },
+        ...items.slice(0, 7),
+      ]);
+    } catch (error) {
+      setResultError(error instanceof Error ? error.message : 'Не удалось получить итог сигнала');
+    } finally {
+      setResultPending(false);
+    }
+  }, [participantId, phase, signal]);
+
   useEffect(() => {
     if (countdown === null || phase !== 'live') return;
     if (countdown <= 0) {
-      setCountdown(0);
-      finishTrade();
+      void finishSignal();
       return;
     }
-    const id = setTimeout(() => setCountdown(c => (c !== null ? c - 1 : null)), 1000);
-    return () => clearTimeout(id);
-  }, [countdown, phase]);
+    const timeout = window.setTimeout(() => {
+      const end = timerEndRef.current;
+      const remaining = end ? Math.max(0, Math.ceil((end - Date.now()) / 1000)) : countdown - 1;
+      setCountdown(remaining);
+    }, 1000);
+    return () => window.clearTimeout(timeout);
+  }, [countdown, finishSignal, phase]);
 
-  const handleGateSubmit = useCallback((e: React.FormEvent) => {
-    e.preventDefault();
+  const handleGateSubmit = useCallback((event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
     const cleaned = pocketId.replace(/\D/g, '');
     if (cleaned.length < 6) {
       setIdError('Введите корректный ID (минимум 6 цифр)');
@@ -150,7 +298,7 @@ export default function App() {
     setIdError('');
     setParticipantId(cleaned);
     setGateLeaving(true);
-    setTimeout(() => setGateDone(true), 720);
+    window.setTimeout(() => setGateDone(true), 720);
   }, [pocketId]);
 
   const handleExit = useCallback(() => {
@@ -162,104 +310,89 @@ export default function App() {
     setPhase('idle');
     setCountdown(null);
     setResult(null);
+    setResultPending(false);
+    setClosePrice(null);
+    setRecoveryCount(0);
     setApiError('');
+    setResultError('');
+    resultRequestedRef.current = false;
   }, []);
 
   const handleGetSignal = useCallback(async () => {
     setLoading(true);
     setAnalyzing(true);
     setApiError('');
+    setResultError('');
     setResult(null);
+    setSignal(null);
     setPhase('idle');
     setCountdown(null);
+    setClosePrice(null);
+    setRecoveryCount(0);
+    resultRequestedRef.current = false;
 
     try {
-      // AI "thinking" delay for UX
-      await new Promise(r => setTimeout(r, 900));
-
-      const data: Signal = await apiGet('/signal', { participant_id: participantId });
-      const enriched: Signal = {
-        ...data,
-        reason: buildReason(data),
-        entry_price: data.entry_price ?? null,
-      };
-      setSignal(enriched);
+      await new Promise(resolve => window.setTimeout(resolve, 500));
+      const payload = await apiGet('/api/bot/signal', { participant_id: participantId });
+      if (isAiUnavailable(payload)) {
+        setAiAvailable(false);
+        throw new Error('ИИ сейчас недоступен. Сигнал не сформирован. Попробуйте позже.');
+      }
+      const received = normalizeSignal(payload);
+      setSignal(received);
+      setAiAvailable(true);
       setPhase('ready');
-      setAnalyzing(false);
-    } catch (err: any) {
-      setApiError(err.message || 'Не удалось получить сигнал');
-      setAnalyzing(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Не удалось получить сигнал';
+      setApiError(error instanceof Error && error.name === 'AI_UNAVAILABLE'
+        ? 'ИИ сейчас недоступен. Сигнал не сформирован. Попробуйте позже.'
+        : message);
+      setPhase('idle');
     } finally {
+      setAnalyzing(false);
       setLoading(false);
     }
   }, [participantId]);
 
-  const handleStartTrade = useCallback(() => {
-    if (!signal) return;
+  const handleStartTracking = useCallback(() => {
+    if (!signal || signal.entry_price === null) {
+      setApiError('Для отслеживания сервер должен вернуть цену входа.');
+      return;
+    }
     entryRef.current = signal.entry_price;
-    timerEndRef.current = Date.now() + 120_000;
+    timerEndRef.current = Date.now() + 120000;
+    resultRequestedRef.current = false;
     setPhase('live');
     setCountdown(120);
     setResult(null);
+    setClosePrice(null);
+    setResultError('');
   }, [signal]);
-
-  const finishTrade = useCallback(async () => {
-    if (!signal || phase === 'result') return;
-    setPhase('result');
-
-    // Auto-track: weighted by confidence (high conf → more often win for demo feel)
-    // In production python-bot can compare entry vs close price
-    const conf = signal.confidence || 80;
-    const won = Math.random() * 100 < Math.min(92, conf + 5);
-
-    try {
-      await apiPost('/signal/result', {
-        won,
-        entry_price: entryRef.current || 0,
-        close_price: 0,
-      });
-    } catch {
-      // ignore API errors on result — still show UI
-    }
-
-    setResult(won ? 'win' : 'lose');
-    setHistory(h => [
-      {
-        pair: signal.pair,
-        direction: signal.direction,
-        result: won ? 'win' : 'lose',
-        time: formatTime(new Date()).replace(' MSK', ''),
-      },
-      ...h.slice(0, 7),
-    ]);
-    setCountdown(null);
-  }, [signal, phase]);
 
   const handleCopyPair = useCallback(async () => {
     if (!signal) return;
     try {
       await navigator.clipboard.writeText(signal.pair);
       setCopied(true);
-      setTimeout(() => setCopied(false), 1600);
+      window.setTimeout(() => setCopied(false), 1600);
     } catch {
-      // fallback
-      const ta = document.createElement('textarea');
-      ta.value = signal.pair;
-      document.body.appendChild(ta);
-      ta.select();
+      const textarea = document.createElement('textarea');
+      textarea.value = signal.pair;
+      document.body.appendChild(textarea);
+      textarea.select();
       document.execCommand('copy');
-      document.body.removeChild(ta);
+      document.body.removeChild(textarea);
       setCopied(true);
-      setTimeout(() => setCopied(false), 1600);
+      window.setTimeout(() => setCopied(false), 1600);
     }
   }, [signal]);
 
-  const [f1, f2] = signal ? flagsForPair(signal.pair) : ['🏳️', '🏳️'];
-  const isUp = signal ? dirUp(signal.direction) : true;
+  const [baseCode, quoteCode] = signal ? marketCodes(signal.pair) : ['FX', 'OTC'];
+  const isUp = signal ? directionIsUp(signal.direction) : true;
+  const reason = signal?.reason || signal?.message;
 
   return (
     <>
-      {/* ── Welcome Gate ── */}
       {!gateDone && (
         <div className={`welcome-gate${gateLeaving ? ' is-leaving' : ''}`}>
           <div className="gate-orbit gate-orbit-a" />
@@ -281,20 +414,20 @@ export default function App() {
                 <span className="id-prefix">#</span>
                 <input
                   id="pocket-id"
+                  data-testid="input-pocket-id"
                   type="tel"
                   inputMode="numeric"
                   autoComplete="off"
                   maxLength={9}
                   placeholder="000 000 000"
                   value={pocketId}
-                  onChange={e => { setPocketId(e.target.value); setIdError(''); }}
+                  onChange={event => { setPocketId(event.target.value); setIdError(''); }}
                 />
               </div>
-              <span className="id-error">{idError}</span>
-              <button type="submit" className="btn btn-glow btn-lg gate-submit">
+              <span className="id-error" data-testid="text-id-error">{idError}</span>
+              <button type="submit" data-testid="button-open-access" className="btn btn-glow btn-lg gate-submit">
                 <span className="btn-shine" />
                 <span className="btn-label">Открыть доступ</span>
-                <span className="btn-arrow">→</span>
               </button>
             </form>
             <div className="gate-safe">
@@ -304,29 +437,29 @@ export default function App() {
         </div>
       )}
 
-      {/* ── Main app after auth ── */}
       {gateDone && (
         <div className="app-shell">
           <div className="app-bg" />
-
           <header className="app-topbar">
             <div className="app-brand">
               <span className="logo-orb" />
               <span>RADIK <em>AI</em></span>
             </div>
             <div className="app-top-meta">
-              <span className={`conn-pill ${connectionStatus}`}>
+              <span className={`conn-pill ${connectionStatus}`} data-testid="status-connection">
                 <i />
-                {connectionStatus === 'online' ? 'ONLINE' : connectionStatus === 'connecting' ? '...' : 'OFFLINE'}
+                {connectionStatus === 'online' ? 'ONLINE' : connectionStatus === 'connecting' ? 'CONNECTING' : 'OFFLINE'}
+              </span>
+              <span className={`ai-pill${aiAvailable === false ? ' unavailable' : ''}`} data-testid="status-ai">
+                {aiAvailable === false ? 'AI UNAVAILABLE' : aiAvailable === null ? 'AI CHECK' : 'AI READY'}
               </span>
               <span className="app-clock">{clock}</span>
               <span className="app-uid">#{participantId}</span>
-              <button className="app-exit" onClick={handleExit}>Выйти</button>
+              <button className="app-exit" data-testid="button-exit" onClick={handleExit}>Выйти</button>
             </div>
           </header>
 
           <main className="signal-stage">
-            {/* Idle — big CTA */}
             {phase === 'idle' && !analyzing && (
               <div className="stage-idle">
                 <div className="idle-orb" />
@@ -334,91 +467,94 @@ export default function App() {
                 <p>ИИ сканирует OTC-пары и выдаёт точку входа с объяснением.</p>
                 <button
                   className="btn btn-glow btn-xl"
-                  onClick={handleGetSignal}
+                  data-testid="button-get-signal"
+                  onClick={() => void handleGetSignal()}
                   disabled={loading}
                 >
                   <span className="btn-shine" />
                   <span className="btn-label">{loading ? 'Загрузка...' : 'Получить сигнал'}</span>
                 </button>
-                {apiError && <p className="stage-error">{apiError}</p>}
+                <div className="connection-note">
+                  <span className={`connection-note-dot ${connectionStatus}`} />
+                  Соединение: {connectionStatus === 'online' ? 'сервер подключён' : connectionStatus === 'connecting' ? 'проверка сервера' : 'сервер недоступен'}
+                </div>
+                {aiAvailable === false && <p className="stage-error" data-testid="error-ai-unavailable">ИИ сейчас недоступен. Сигнал не сформирован.</p>}
+                {apiError && <p className="stage-error" data-testid="error-signal">{apiError}</p>}
               </div>
             )}
 
-            {/* Analyzing */}
             {analyzing && (
-              <div className="stage-analyzing">
-                <div className="ai-spinner">
-                  <span /><span /><span />
-                </div>
+              <div className="stage-analyzing" data-testid="status-analyzing">
+                <div className="ai-spinner"><span /><span /><span /></div>
                 <h2>ИИ анализирует рынок...</h2>
                 <p>Свечи · тики · импульс · выплата</p>
               </div>
             )}
 
-            {/* Signal card */}
             {signal && (phase === 'ready' || phase === 'live' || phase === 'result') && !analyzing && (
               <div className={`signal-panel phase-${phase}`}>
-                {/* Pair row */}
                 <div className="sig-pair-row">
-                  <div className="sig-flags">
-                    <span className="flag" title="Base">{f1}</span>
+                  <div className="sig-flags" aria-label={`Валюты ${baseCode} и ${quoteCode}`}>
+                    <span className="currency-code">{baseCode}</span>
                     <span className="flag-slash">/</span>
-                    <span className="flag" title="Quote">{f2}</span>
+                    <span className="currency-code">{quoteCode}</span>
                   </div>
                   <div className="sig-pair-info">
-                    <strong>{signal.pair}</strong>
+                    <strong data-testid="text-pair">{signal.pair}</strong>
                     <span className="sig-time">{signal.time}</span>
                   </div>
                   <button
                     type="button"
+                    data-testid="button-copy-pair"
                     className={`copy-btn${copied ? ' copied' : ''}`}
-                    onClick={handleCopyPair}
+                    onClick={() => void handleCopyPair()}
                     title="Скопировать пару"
                   >
-                    {copied ? '✓ Скопировано' : '⎘ Копировать'}
+                    {copied ? 'Скопировано' : 'Копировать'}
                   </button>
                 </div>
 
-                {/* Direction + confidence */}
-                <div className={`sig-direction ${isUp ? 'up' : 'down'}`}>
-                  <span className="dir-arrow">{isUp ? '▲' : '▼'}</span>
-                  <span className="dir-text">{isUp ? 'ВВЕРХ' : 'ВНИЗ'}</span>
-                  <span className="dir-badge">{signal.confidence}%</span>
+                <div className={`sig-direction ${isUp ? 'up' : 'down'}`} data-testid="text-direction">
+                  <span className="dir-arrow">{isUp ? 'UP' : 'DOWN'}</span>
+                  <span className="dir-text">{directionLabel(signal.direction)}</span>
+                  <span className="dir-badge" data-testid="text-confidence">{signal.confidence}%</span>
                 </div>
 
-                {/* Meta chips */}
                 <div className="sig-chips">
                   <div className="chip">
                     <span>Вход</span>
-                    <strong>{signal.entry_price != null ? signal.entry_price : '—'}</strong>
+                    <strong data-testid="text-entry-price">{signal.entry_price !== null ? signal.entry_price : '—'}</strong>
                   </div>
                   <div className="chip">
                     <span>Экспирация</span>
-                    <strong>{signal.expiry || '2 мин'}</strong>
+                    <strong>{signal.expiry}</strong>
                   </div>
                   <div className="chip">
                     <span>Выплата</span>
-                    <strong>{signal.payout || '92%'}</strong>
+                    <strong>{signal.payout}</strong>
+                  </div>
+                  <div className="chip recovery-chip">
+                    <span>Восстановление</span>
+                    <strong data-testid="text-recovery-count">{recoveryCount} / 2</strong>
                   </div>
                 </div>
 
-                {/* AI reason */}
                 <div className="sig-reason">
-                  <div className="reason-head">
-                    <span className="reason-dot" />
-                    Почему заходим
-                  </div>
-                  <p>{buildReason(signal)}</p>
+                  <div className="reason-head"><span className="reason-dot" /> Почему заходим</div>
+                  <p>{reason || 'Пояснение от модели не передано сервером.'}</p>
                 </div>
 
-                {/* Live timer */}
+                <div className="no-trade-note">Сделки не открываются автоматически. Нажмите кнопку только после ручного действия на платформе.</div>
+
                 {phase === 'live' && countdown !== null && (
-                  <div className="sig-timer">
+                  <div className="sig-timer" data-testid="status-countdown">
                     <div className="timer-ring">
-                      <svg viewBox="0 0 120 120">
+                      <svg viewBox="0 0 120 120" aria-hidden="true">
                         <circle cx="60" cy="60" r="52" className="ring-bg" />
                         <circle
-                          cx="60" cy="60" r="52"
+                          cx="60"
+                          cy="60"
+                          r="52"
                           className="ring-fg"
                           style={{
                             strokeDasharray: `${2 * Math.PI * 52}`,
@@ -426,58 +562,73 @@ export default function App() {
                           }}
                         />
                       </svg>
-                      <span className="timer-val">{fmtCountdown(countdown)}</span>
+                      <span className="timer-val">{formatCountdown(countdown)}</span>
                     </div>
-                    <p className="timer-hint">Отслеживание сделки...</p>
+                    <p className="timer-hint">Отслеживание сигнала · 2 минуты</p>
                   </div>
                 )}
 
-                {/* Result animation */}
-                {phase === 'result' && result && (
-                  <div className={`sig-result ${result}`}>
+                {phase === 'result' && (
+                  <div className={`sig-result ${result || 'neutral'}`} data-testid="status-result">
                     <div className="result-burst" />
-                    <div className="result-label">
-                      {result === 'win' ? 'WIN' : 'LOSE'}
+                    {resultPending ? (
+                      <>
+                        <div className="result-label">ОЖИДАНИЕ</div>
+                        <p>Запрашиваем финальную цену у сервера...</p>
+                      </>
+                    ) : result ? (
+                      <>
+                        <div className="result-label">{result === 'win' ? 'WIN' : 'LOSE'}</div>
+                        <p>{result === 'win' ? 'Сигнал зашёл. Итог подтверждён сервером.' : 'Сигнал не зашёл. Итог подтверждён сервером.'}</p>
+                      </>
+                    ) : (
+                      <>
+                        <div className="result-label">НЕТ ИТОГА</div>
+                        <p>{resultError || 'Сервер не вернул итог сигнала.'}</p>
+                      </>
+                    )}
+                    <div className="result-details">
+                      <span>Финальная цена</span>
+                      <strong data-testid="text-close-price">{closePrice !== null ? closePrice : '—'}</strong>
                     </div>
-                    <p>
-                      {result === 'win'
-                        ? 'Сигнал зашёл. Прибыль зафиксирована.'
-                        : 'Сигнал не зашёл. Можно взять следующий.'}
-                    </p>
+                    <div className="result-details">
+                      <span>Восстановление</span>
+                      <strong data-testid="text-result-recovery">{recoveryCount} / 2</strong>
+                    </div>
+                    {resultError && !resultPending && <p className="result-error" data-testid="error-result">{resultError}</p>}
                   </div>
                 )}
 
-                {/* Actions */}
                 <div className="sig-actions">
                   {phase === 'ready' && (
-                    <button className="btn btn-glow btn-lg" onClick={handleStartTrade}>
+                    <button className="btn btn-glow btn-lg" data-testid="button-start-tracking" onClick={handleStartTracking}>
                       <span className="btn-shine" />
-                      <span className="btn-label">Открыть сделку · 2 мин</span>
+                      <span className="btn-label">Начать отслеживание · 2 мин</span>
                     </button>
                   )}
                   {(phase === 'result' || phase === 'ready') && (
                     <button
                       className="btn btn-ghost btn-lg"
-                      onClick={handleGetSignal}
-                      disabled={loading}
+                      data-testid="button-new-signal"
+                      onClick={() => void handleGetSignal()}
+                      disabled={loading || resultPending}
                     >
-                      {loading ? '...' : 'Новый сигнал'}
+                      {loading ? 'Загрузка...' : 'Новый сигнал'}
                     </button>
                   )}
                 </div>
               </div>
             )}
 
-            {/* Mini history */}
             {history.length > 0 && (
               <div className="mini-history">
-                <span className="mh-title">Последние</span>
-                {history.map((h, i) => (
-                  <div key={i} className={`mh-item ${h.result}`}>
-                    <span>{h.pair}</span>
-                    <span>{dirUp(h.direction) ? '▲' : '▼'}</span>
-                    <span className="mh-res">{h.result === 'win' ? 'WIN' : 'LOSE'}</span>
-                    <span className="mh-time">{h.time}</span>
+                <span className="mh-title">Последние результаты</span>
+                {history.map((item, index) => (
+                  <div key={`${item.pair}-${item.time}-${index}`} className={`mh-item ${item.result}`} data-testid={`row-history-${index}`}>
+                    <span>{item.pair}</span>
+                    <span className="history-direction">{directionLabel(item.direction)}</span>
+                    <span className="mh-res">{item.result === 'win' ? 'WIN' : 'LOSE'}</span>
+                    <span className="mh-time">{item.time}</span>
                   </div>
                 ))}
               </div>
