@@ -284,6 +284,22 @@ app = Flask(__name__)
 CORS(app)
 
 
+class ProxyPrefixMiddleware:
+    def __init__(self, application):
+        self.application = application
+
+    def __call__(self, environ, start_response):
+        path = environ.get("PATH_INFO", "")
+        for prefix in ("/api/bot", "/bot"):
+            if path.startswith(prefix):
+                environ["PATH_INFO"] = path[len(prefix):] or "/"
+                break
+        return self.application(environ, start_response)
+
+
+app.wsgi_app = ProxyPrefixMiddleware(app.wsgi_app)
+
+
 @app.before_request
 def strip_proxy_prefix():
     for prefix in ("/api/bot", "/bot"):
