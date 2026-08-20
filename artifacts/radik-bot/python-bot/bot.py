@@ -140,6 +140,7 @@ last_error: Optional[str] = None
 signal_lock = threading.Lock()
 active_signal: Optional[dict] = None
 recovery_count = 0
+last_prices: dict[str, float] = {}
 OTC_PAIRS = ["EURUSD_otc", "GBPUSD_otc", "USDJPY_otc", "AUDUSD_otc", "USDCAD_otc"]
 
 
@@ -156,6 +157,7 @@ def _market_snapshot(active: str) -> dict:
     closes = [float(value) for value in frame["close"].tail(30).tolist()]
     highs = [float(value) for value in frame["high"].tail(30).tolist()]
     lows = [float(value) for value in frame["low"].tail(30).tolist()]
+    last_prices[active] = closes[-1]
     return {
         "active": active,
         "price": closes[-1],
@@ -165,6 +167,18 @@ def _market_snapshot(active: str) -> dict:
         "trend": "up" if closes[-1] >= closes[-5] else "down",
         "volatility": statistics.pstdev(closes[-12:]) if len(closes) >= 12 else 0,
     }
+
+
+def _cached_price(active: str) -> Optional[float]:
+    price = last_prices.get(active)
+    if price is not None:
+        return price
+    market = global_value.pairs.get(active) or {}
+    history = market.get("history") or []
+    for item in reversed(history):
+        if isinstance(item, dict) and item.get("price") is not None:
+            return float(item["price"])
+    return None
 
 
 def _gemini_analysis(snapshot: dict, recovery: int = 0) -> dict:
@@ -183,7 +197,7 @@ def _gemini_analysis(snapshot: dict, recovery: int = 0) -> dict:
         f"closes: {snapshot['closes']}; recovery_level: {recovery}."
     )
     response = requests.post(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent",
         params={"key": key},
         json={"contents": [{"parts": [{"text": prompt}]}],
               "generationConfig": {"responseMimeType": "application/json"}},
@@ -337,8 +351,11 @@ def signal():
             }
             return jsonify(active_signal)
     except Exception as exc:
-        log.exception("Ошибка подготовки сигнала")
-        return jsonify({"error": str(exc)}), 503
+        log.warning("Ошибка подготовки Gemini-сигнала: %s", type(exc).__name__)
+        return jsonify({
+            "error": "Gemini временно недоступен или ключ не имеет доступа к модели",
+            "ai_available": False,
+        }), 503
 
 
 @app.route("/price/<active>", methods=["GET"])
@@ -346,8 +363,10 @@ def price(active: str):
     if active not in OTC_PAIRS:
         return jsonify({"error": "Недопустимая OTC-пара"}), 400
     try:
-        snapshot = _market_snapshot(active)
-        return jsonify({"active": active, "price": snapshot["price"], "time": time.time()})
+        current = _cached_price(active)
+        if current is None:
+            current = _market_snapshot(active)["price"]
+        return jsonify({"active": active, "price": current, "time": time.time()})
     except Exception as exc:
         return jsonify({"error": str(exc)}), 503
 
@@ -362,10 +381,9 @@ def signal_result():
     entry_price = float(data.get("entry_price") or active_signal["entry_price"])
     close_price = float(data.get("close_price") or 0)
     if not close_price:
-        try:
-            close_price = float(_market_snapshot(active_signal["raw_pair"])["price"])
-        except Exception as exc:
-            return jsonify({"error": str(exc)}), 503
+        close_price = _cached_price(active_signal["raw_pair"])
+    if close_price is None:
+        return jsonify({"error": "Цена закрытия ещё не получена"}), 503
     up = active_signal["direction"] == "ВВЕРХ"
     won = close_price > entry_price if up else close_price < entry_price
     if close_price == entry_price:
